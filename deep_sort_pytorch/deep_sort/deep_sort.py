@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 
@@ -12,25 +13,38 @@ __all__ = ['DeepSort']
 
 
 class DeepSort(object):
-    def __init__(self, model_path, max_dist=0.2, min_confidence=0.3, nms_max_overlap=1.0, max_iou_distance=0.7, max_age=70, n_init=3, nn_budget=100, use_cuda=True):
-        self.min_confidence = min_confidence
-        self.nms_max_overlap = nms_max_overlap
+    def __init__(self, cfg, cwd):
+        self.min_confidence = cfg.min_confidence
+        self.nms_max_overlap = cfg.nms_max_overlap
+        self.extractor = Extractor(cwd + os.sep + cfg.model_path, cfg.use_cuda)
+        self.cfg = cfg
 
-        self.extractor = Extractor(model_path, use_cuda=use_cuda)
+        self.tracker = None  # is initialized in self.reset_state()
+        self.trajectories = None  # is initialized in self.reset_state()
+        self.reset_state()
 
-        max_cosine_distance = max_dist
-        metric = NearestNeighborDistanceMetric(
-            "cosine", max_cosine_distance, nn_budget)
+    def reset_state(self):
+        del self.tracker
+        max_cosine_distance = self.cfg.max_dist
+        metric = NearestNeighborDistanceMetric("cosine", max_cosine_distance, self.cfg.nn_budget)
         self.tracker = Tracker(
-            metric, max_iou_distance=max_iou_distance, max_age=max_age, n_init=n_init)
+            metric,
+            max_iou_distance=self.cfg.max_iou_distance,
+            max_age=self.cfg.max_age,
+            n_init=self.cfg.n_init,
+        )
+        self.trajectories = {}  # TODO encapsulate into a separate class?
 
     def update(self, bbox_xywh, confidences, ori_img):
         self.height, self.width = ori_img.shape[:2]
         # generate detections
         features = self._get_features(bbox_xywh, ori_img)
         bbox_tlwh = self._xywh_to_tlwh(bbox_xywh)
-        detections = [Detection(bbox_tlwh[i], conf, features[i]) for i, conf in enumerate(
-            confidences) if conf > self.min_confidence]
+        detections = [
+            Detection(bbox_tlwh[i], conf, features[i])
+            for i, conf in enumerate(confidences)
+            if conf > self.min_confidence
+        ]
 
         # run on non-maximum supression
         boxes = np.array([d.tlwh for d in detections])
@@ -49,8 +63,12 @@ class DeepSort(object):
                 continue
             box = track.to_tlwh()
             x1, y1, x2, y2 = self._tlwh_to_xyxy(box)
+            centroid = ((x2 + x1) // 2, (y2 + y1) // 2)
             track_id = track.track_id
             outputs.append(np.array([x1, y1, x2, y2, track_id], dtype=np.int))
+            if track_id not in self.trajectories:
+                self.trajectories[track_id] = []
+            self.trajectories[track_id].append(centroid)
         if len(outputs) > 0:
             outputs = np.stack(outputs, axis=0)
         return outputs
@@ -66,8 +84,8 @@ class DeepSort(object):
             bbox_tlwh = bbox_xywh.copy()
         elif isinstance(bbox_xywh, torch.Tensor):
             bbox_tlwh = bbox_xywh.clone()
-        bbox_tlwh[:, 0] = bbox_xywh[:, 0] - bbox_xywh[:, 2] / 2.
-        bbox_tlwh[:, 1] = bbox_xywh[:, 1] - bbox_xywh[:, 3] / 2.
+        bbox_tlwh[:, 0] = bbox_xywh[:, 0] - bbox_xywh[:, 2] / 2.0
+        bbox_tlwh[:, 1] = bbox_xywh[:, 1] - bbox_xywh[:, 3] / 2.0
         return bbox_tlwh
 
     def _xywh_to_xyxy(self, bbox_xywh):
